@@ -13,7 +13,7 @@ def main():
     exp_width = int(args.exp_width)
     mant_width = int(args.mant_width)
 
-    for x in FPValue.neg_inf(exp_width,mant_width).iter():
+    for x in FPValue.pos_inf(exp_width,mant_width).reverse_iter():
         if x.is_subnormal():
             print("*",end='')
         print(x)
