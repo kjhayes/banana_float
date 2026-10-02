@@ -60,6 +60,22 @@ class FPValue:
         assert fp.is_subnormal()
         return fp
 
+    @classmethod
+    def from_f64(cls, value):
+        bits = bitstring.BitArray(f"float64={value}")
+        sign = bits[0:1] == '0b1'
+        exp_data = bits[1:12] 
+        mant_data = bits[12:64]
+        return cls(sign, exp_data, mant_data)
+
+    @classmethod
+    def from_f32(cls, value):
+        bits = bitstring.BitArray(f"float32={value}")
+        sign = bits[0:1] == '0b1'
+        exp_data = bits[1:9] 
+        mant_data = bits[9:32]
+        return cls(sign, exp_data, mant_data)
+
     def is_zero(self):
         return (self._exp + self._mant).count(1) == 0
 
@@ -137,7 +153,8 @@ class FPValue:
 
     def succ(self):
         if self.is_nan():
-            raise RuntimeError("Cannot take the successor of a NaN floating point value!")
+            return self
+
         elif self.is_inf(): 
             if self.is_negative():
                 exp = bitstring.BitArray(self.exponent_width())
@@ -195,174 +212,15 @@ class FPValue:
 
     def pred(self):
         if self.is_nan():
-            raise RuntimeError("Cannot take the predecessor of a NaN floating point value!")
+            return self
         return self.inverted().succ().inverted()
 
-    def cast_below_mantissa(self, mant_width: int):
-        if mant_width < self.mantissa_width():
-            return self.cast_below_shrink_mantissa(self.mantissa_width() - mant_width)
-        if mant_width > self.mantissa_width():
-            return self.cast_below_grow_mantissa(mant_width - self.mantissa_width())
-        else:
-            return self
-
-    def cast_below_shrink_mantissa(self, mant_sub: int):
-        if self.is_inf():
-            return FPValue.inf(self.sign(), self.exponent_width(), self.mantissa_width() - mant_sub)
-        elif self.is_nan():
-            mant = bitstring.BitArray(self.mantissa())
-            del mant[-mant_sub:]
-            if mant.count(1) == 0:
-                mant.set(1, -1)
-            return FPValue(self.sign(), self.exponent(), mant)
-
-        # Normal or Subnormal
-
-        mant = bitstring.BitArray(self.mantissa())
-        dropping = mant[-mant_sub:]
-        if not self.is_negative() or dropping.count(1) == 0:
-            del mant[-mant_sub:]
-            return FPValue(self.sign(), self.exponent(), mant)
-        else:
-            # We are negative and so dropping non-zero
-            # mantissa bits will actually *increase* our
-            # relative value
-            #
-            # Do it anyways and then backtrack until we are
-            # small enough
-            # (SLOW) TODO: Do something cleverer to be fast
-            del mant[-mant_sub:]
-            fp = FPValue(self.sign(), self.exponent(), mant)
-            while fp > self:
-                fp = fp.pred()
-            return fp
-
-    def cast_below_grow_mantissa(self, mant_add: int):
-        # Just append some zeros onto the end
-        zeros = bitstring.Bits(mant_add)
-        return FPValue(self.sign(), self.exponent(), self.mantissa() + zeros)
-
-    def cast_below_exponent(self, exp_width: int):
-        if exp_width < self.exponent_width():
-            return self.cast_below_shrink_exponent(self.exponent_width() - exp_width)
-        if exp_width > self.exponent_width():
-            return self.cast_below_grow_exponent(exp_width - self.exponent_width())
-        else:
-            return self
-
-    def cast_below_shrink_exponent(self, exp_sub: int):
-        assert exp_sub < self.exponent_width()
-        if self.is_inf() or self.is_nan():
-            return FPValue(self.sign(), self.exponent()[0:-exp_sub], self.mantissa())
-
-        exp_width = self.exponent_width() - exp_sub
-        assert exp_width > 0
-
-        if self.is_subnormal():
-            old_subnormal_unbiased = 1-self.bias()
-            new_subnormal_unbiased = 1-FPValue.exponent_bias(exp_width)
-            order_diff = new_subnormal_unbiased - old_subnormal_unbiased
-            mant = self.mantissa() >> order_diff
-            fp = FPValue(self.sign(), integer_to_bits(0,exp_width), mant)
-            if self.sign():
-                while fp > self:
-                    fp = fp.pred()
-            return fp
-
-        # We are normal
-        unbiased = self.unbiased_exponent()
-        bias = FPValue.exponent_bias(self.exponent_width() - exp_sub)
-        new_biased = unbiased + bias
-        if 0 < new_biased and new_biased < (2**exp_width)-1:
-            # The result can be normal
-            exp = integer_to_bits(new_biased, exp_width)
-            return FPValue(self.sign(), exp, self.mantissa())
-
-        if new_biased >= (2**exp_width)-1:
-            # We overflow
-            if self.is_negative():
-                return FPValue.neg_inf(exp_width, self.mantissa_width())
-            else:
-                return FPValue.pos_inf(exp_width, self.mantissa_width()).pred()
-
-        # We underflow to subnormal
-        mant = bitstring.BitArray(self.mantissa())
-
-        # Materialize the implicit leading 1
-        mant = mant >> 1 # This drops a bit
-        mant.set(1,0)
-
-        old_normal_unbiased = self.unbiased_exponent()+1
-        new_subnormal_unbiased = 1-FPValue.exponent_bias(exp_width)
-        order_diff = new_subnormal_unbiased - old_normal_unbiased
-        assert order_diff >= 0
-        mant = mant >> order_diff
-        fp = FPValue(self.sign(), integer_to_bits(0, exp_width), mant)
-        if self.sign():
-            while fp > self:
-                fp = fp.pred()
-        return fp
-
-    def cast_below_grow_exponent(self, exp_add: int):
-        assert exp_add > 0
-
-        exp_width = self.exponent_width() + exp_add
-
-        if self.is_nan() or self.is_inf():
-            fill = bitstring.Bits(exp_add)
-            fill.set(1)
-            return FPValue(self.sign(), self.exponent() + fill, self.mantissa())
-
-        # Growing the exponent
-        unbiased = self.unbiased_exponent()
-        new_bias = FPValue.exponent_bias(exp_width)
-        new_biased = unbiased + new_bias
-        assert new_biased >= 0
-
-        if self.is_normal():
-            # Normal -> Normal, we can just use the same mantissa
-
-            # assert that the new exponent will still result in a normal value,
-            # should always be the case if we grow the exponent width
-            assert new_biased > 0 and new_biased < (2**new_bias)-1
-
-            exp = integer_to_bits(new_biased, exp_width)
-            return FPValue(self.sign(), exp, self.mantissa())
-
-        else:
-            # We need to shift the mantissa trying to drop
-            # the most significant one's bit. Every time we do,
-            # the exponent needs to decrease by one to compensate.
-            mant = bitstring.BitArray(self.mantissa())
-            while mant[0:1] == '0b0' and new_biased > 1:
-                del mant[0:1]
-                mant = mant + '0b0'
-                unbiased -= 1
-                new_biased -= 1
-
-            if new_biased <= 1:
-                # Subnormal -> Subnormal
-                exp = integer_to_bits(0, exp_width)
-                fp = FPValue(self.sign(), exp, mant)
-                return fp
-            else:
-                # Subnormal -> Normal
-                assert mant[0:1] == '0b1'
-                del mant[0:1]
-                mant = mant + '0b0'
-                exp = integer_to_bits(new_biased, exp_width)
-                fp = FPValue(self.sign(), exp, mant)
-                return fp
-
-    # Cast to the corresponding width and if rounding is required,
-    # always round "down" so that x.cast_below() <= x always.
     def cast_below(self, exp_width: int, mant_width: int):
-        # First cast mantissa, then exponent: TODO Check that this is fine... -KJH
-        return self.cast_below_mantissa(mant_width).cast_below_exponent(exp_width)
+        return self.to_precise().imprecise_below(exp_width, mant_width)
 
     def to_precise(self) -> PreciseFPValue:
         if self.is_inf():
-            raise RuntimeError("Cannot convert infinite FPValue to a PreciseFPValue")
+            return PreciseFPValue(-1 if self.sign() else 1, 0, is_inf=True)
         if self.is_nan():
             raise RuntimeError("Cannot convert NaN FPValue to a PreciseFPValue")
         return PreciseFPValue.from_ieee754_bits(self._sign, self._exp, self._mant)
@@ -416,10 +274,9 @@ class FPValue:
         while biased_exp <= 0 or biased_exp >= (2**exp_bits)-1:
             exp_bits += 1
             bias = (2**(exp_bits-1))-1
-            biased_exp = exp - bias
+            biased_exp = exp + bias
 
-        exp_data = bitstring.Bits(bin=bin(biased_exp))
-        assert(exp_data.len == exp_bits)
+        exp_data = integer_to_bits(biased_exp, exp_bits)
 
         return FPValue(sign, exp_data, mant_data)
 
